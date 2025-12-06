@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    volumes:
+      - app-logs:/app/logs
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+      - ./nginx/auth:/etc/nginx/auth
+      - app-logs:/app/logs:ro
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  app-logs:

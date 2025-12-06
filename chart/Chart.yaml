@@ -1,0 +1,5 @@
+apiVersion: v2
+name: i2btech-app
+description: A Helm chart for i2btech DevOps challenge
+version: 0.1.0
+appVersion: "1.0.0"

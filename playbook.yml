@@ -1,0 +1,225 @@
+---
+- name: Setup Kubernetes environment for i2btech challenge
+  hosts: localhost
+  become: yes
+  vars:
+    minikube_version: "1.32.0"
+    helm_version: "3.14.0"
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - docker.io
+          - curl
+          - wget
+          - apt-transport-https
+          - gnupg2
+          - software-properties-common
+        state: present
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+
+    - name: Install Docker
+      apt:
+        name: docker-ce
+        state: present
+
+    - name: Add current user to docker group
+      user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: yes
+
+    - name: Download and install Minikube
+      get_url:
+        url: "https://storage.googleapis.com/minikube/releases/v{{ minikube_version }}/minikube-linux-amd64"
+        dest: /usr/local/bin/minikube
+        mode: '0755'
+
+    - name: Download and install kubectl
+      shell: |
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
+      args:
+        creates: /usr/local/bin/kubectl
+
+    - name: Download and install Helm
+      get_url:
+        url: "https://get.helm.sh/helm-v{{ helm_version }}-linux-amd64.tar.gz"
+        dest: /tmp/helm.tar.gz
+      register: helm_download
+
+    - name: Extract Helm
+      unarchive:
+        src: /tmp/helm.tar.gz
+        dest: /tmp
+        remote_src: yes
+
+    - name: Install Helm binary
+      copy:
+        src: "/tmp/linux-amd64/helm"
+        dest: /usr/local/bin/helm
+        mode: '0755'
+        remote_src: yes
+
+    - name: Install Terraform
+      shell: |
+        wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor | sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg
+        echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+        sudo apt update && sudo apt install terraform -y
+      args:
+        creates: /usr/bin/terraform
+
+    - name: Start Minikube
+      command: minikube start --driver=docker --cpus=2 --memory=4096
+      async: 300
+      poll: 10
+      environment:
+        CHANGE_MINIKUBE_NONE_USER: true
+
+    - name: Enable Minikube ingress addon
+      command: minikube addons enable ingress
+      async: 60
+      poll: 5
+
+    - name: Copy kubectl config to user directory
+      copy:
+        src: "{{ ansible_user_dir }}/.kube/config"
+        dest: /tmp/kubeconfig
+        remote_src: yes
+      when: ansible_user == "root"
+
+    - name: Create namespace using kubectl command
+      command: >
+        kubectl apply -f - <<EOF apiVersion: v1 kind: Namespace metadata:
+          name: i2btech-namespace
+        EOF
+      environment:
+        KUBECONFIG: "{{ '/tmp/kubeconfig' if ansible_user == 'root' else ansible_user_dir + '/.kube/config' }}"
+
+    - name: Build Docker image
+      docker_image:
+        name: i2btech-app
+        build:
+          path: "{{ playbook_dir }}"
+        source: build
+        state: present
+
+    - name: Load image into Minikube
+      command: minikube image load i2btech-app:latest
+
+    - name: Create Terraform configuration
+      copy:
+        dest: "{{ playbook_dir }}/terraform/main.tf"
+        content: |
+          terraform {
+            required_providers {
+              helm = {
+                source  = "hashicorp/helm"
+                version = "2.12.1"
+              }
+              kubernetes = {
+                source  = "hashicorp/kubernetes"
+                version = "2.25.2"
+              }
+            }
+          }
+
+          provider "kubernetes" {
+            config_path = "~/.kube/config"
+          }
+
+          provider "helm" {
+            kubernetes {
+              config_path = "~/.kube/config"
+            }
+          }
+
+          resource "kubernetes_secret" "basic_auth" {
+            metadata {
+              name      = "basic-auth"
+              namespace = "i2btech-namespace"
+            }
+
+            data = {
+              auth = "admin:{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g="
+            }
+          }
+
+          resource "helm_release" "i2btech_app" {
+            name       = "i2btech-app"
+            namespace  = "i2btech-namespace"
+            chart      = "{{ playbook_dir }}/chart"
+            wait       = true
+
+            values = [
+              file("{{ playbook_dir }}/chart/values.yaml")
+            ]
+
+            set {
+              name  = "persistence.hostPath"
+              value = "/data/app-logs"
+            }
+          }
+
+    - name: Create hostPath directory
+      file:
+        path: /data/app-logs
+        state: directory
+        mode: '0777'
+
+    - name: Initialize Terraform
+      command: terraform init
+      args:
+        chdir: "{{ playbook_dir }}/terraform"
+
+    - name: Apply Terraform configuration
+      command: terraform apply -auto-approve
+      args:
+        chdir: "{{ playbook_dir }}/terraform"
+
+    - name: Get Minikube IP
+      shell: minikube ip
+      register: minikube_ip
+
+    - name: Update /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ minikube_ip.stdout }} i2btech.local"
+        regexp: '^.*i2btech\.local$'
+        state: present
+
+    - name: Wait for application to be ready
+      uri:
+        url: http://i2btech.local
+        status_code: 200
+      register: result
+      until: result.status == 200
+      retries: 30
+      delay: 10
+
+    - name: Display access information
+      debug:
+        msg:
+          - "Application deployed successfully!"
+          - "Access URLs:"
+          - "  - Main page: http://i2btech.local"
+          - "  - Private area: http://i2btech.local/private (user: admin, password: admin123)"
+          - "  - Health: http://i2btech.local/health"
+          - "  - Metrics: http://i2btech.local/metrics"
+          - "Minikube IP: {{ minikube_ip.stdout }}"
