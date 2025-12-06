@@ -5,6 +5,8 @@
   vars:
     minikube_version: "1.32.0"
     helm_version: "3.14.0"
+    ansible_user: "vagrant"
+    project_dir: "/home/vagrant/ib2tech"
 
   tasks:
     - name: Update apt cache
@@ -37,6 +39,12 @@
       apt:
         name: docker-ce
         state: present
+
+    - name: Start Docker service
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
 
     - name: Add current user to docker group
       user:
